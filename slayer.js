@@ -28,17 +28,7 @@ const MAX_TABS = 6;
 // Any tab whose URL *starts with* one of these strings is never closed.
 // Plain prefix matching — add trailing "/" to avoid partial domain hits.
 const EXCEPTION_PREFIXES = [
-    "about:",           // internal Firefox pages
-    //   "https://calendar.google.com/",
-    //   "https://docs.google.com/",
-    //   "https://github.com/",
-    //   "https://gitlab.com/",
-    //   "https://app.slack.com/",
-    //   "https://discord.com/",
-    //   "https://notion.so/",
-    //   "https://linear.app/",
-    //   "moz-extension://", // other extensions' pages
-    //   "chrome://",        // Firefox chrome pages
+    "about:",
 ];
 
 // ============================================================
@@ -125,37 +115,25 @@ async function reap() {
 
     const victims = new Set();
 
-    // ---- Age-based cull ------------------------------------
-    for (const tab of tabs) {
-        const openedAt = tabOpenedAt.get(tab.id);
-        if (openedAt === undefined) {
-            tabOpenedAt.set(tab.id, now);
-            continue;
-        }
+    // Candidates: non-exempt tabs old enough to close, oldest first.
+    const candidates = tabs
+        .filter(t => !isExempt(t))
+        .filter(t => {
+            const openedAt = tabOpenedAt.get(t.id);
+            if (openedAt === undefined) {
+                tabOpenedAt.set(t.id, now);
+                return false;
+            }
+            return (now - openedAt) >= TAB_MAX_AGE_MS;
+        })
+        .sort((a, b) => (tabOpenedAt.get(a.id) ?? now) - (tabOpenedAt.get(b.id) ?? now));
 
-        const age = now - openedAt;
-        if (age < TAB_MAX_AGE_MS) continue;
-        if (isExempt(tab)) continue;
+    // Never close tabs if doing so would bring the total below MAX_TABS.
+    const maxVictims = Math.max(0, tabs.length - MAX_TABS);
 
+    for (const tab of candidates) {
+        if (victims.size >= maxVictims) break;
         victims.add(tab.id);
-    }
-
-    // ---- Max-tab cull --------------------------------------
-    // Count surviving tabs (exempt or young), then close oldest extras.
-    const survivors = tabs.filter(t => !victims.has(t.id));
-    const overBy = survivors.length - MAX_TABS;
-
-    if (overBy > 0) {
-        // Sort killable survivors oldest-first, then take just enough.
-        const killable = survivors
-            .filter(t => !isExempt(t))
-            .sort((a, b) => (tabOpenedAt.get(a.id) ?? now) - (tabOpenedAt.get(b.id) ?? now));
-
-        const extras = killable.slice(0, overBy);
-        for (const tab of extras) {
-            console.log(`[Tab Slayer] Tab count limit: queuing [${tab.id}] "${tab.title}"`);
-            victims.add(tab.id);
-        }
     }
 
     // ---- Close all victims ---------------------------------
@@ -174,7 +152,6 @@ async function reap() {
         await browser.tabs.remove(tabId);
     }
 }
-
 // ---- Bootstrap ---------------------------------------------
 
 async function init() {
