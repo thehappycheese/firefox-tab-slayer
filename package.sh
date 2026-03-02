@@ -1,0 +1,1 @@
+zip -r dist/tab-slayer.zip manifest.json icons/slayer-48.png icons/slayer-96.png slayer.js

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 2,
+  "name": "Tab Slayer",
+  "version": "1.0",
+  "description": "Kills tabs that have been open for too long, with opinionated exeptions.",
+  "icons": {
+    "48": "icons/slayer-48.png",
+    "96": "icons/slayer-96.png"
+  },
+  "permissions": [
+    "tabs"
+  ],
+  "author": "engineernick",
+  "browser_specific_settings": {
+    "gecko": {
+      "id":"tab-slayer@engineernick.com",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "background": {
+    "scripts": [
+      "slayer.js"
+    ],
+    "persistent": true
+  }
+}
