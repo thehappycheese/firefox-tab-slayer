@@ -1,170 +1,265 @@
 // ============================================================
-// Tab Slayer — background.js
+// Tab Slayer — background.js  (MV3-safe)
 // ============================================================
 
-// ------ HARD-CODED SETTINGS ---------------------------------
+// ------ SETTINGS --------------------------------------------
 
-// How long a tab can stay open before being killed (milliseconds)
+// Grace period: once a window is ARMED, a tab must sit past this before
+// it's eligible to be closed (ms). This is the "age" clock.
 const TAB_MAX_AGE_MS = 1000 * 60 * 4; // 4 minutes
 
-// How often to run the reaper sweep (milliseconds)
-const REAPER_INTERVAL_MS = 1000 * 60 * 1; // every 5 minutes
+// How often the reaper sweeps (ms).
+const REAPER_INTERVAL_MS = 1000 * 60 * 1; // every 1 minute
 
-// If true, pinned tabs are never closed
-const SPARE_PINNED_TABS = true;
-
-// If true, the currently active tab in any window is never closed
-const SPARE_ACTIVE_TAB = true;
-
-// If true, tabs that are currently audible (playing audio) are spared
-const SPARE_AUDIBLE_TABS = true;
-
-// Maximum number of tabs allowed across all windows. When exceeded, the
-// oldest non-exempt tabs are closed first until the limit is met.
-// Set to Infinity to disable this feature.
+// Arming FLOOR, per window, counted over *unpinned* tabs only.
+//   unpinned <= MAX_TABS → disarmed: reaper idle, age clocks held at zero.
+//   unpinned >  MAX_TABS → armed:    age clocks tick from the crossing.
+// Crossing up resets every age clock; dropping back to/below the floor
+// (by user OR reaper) resets them again. Infinity = never arm.
 const MAX_TABS = 6;
 
-// ------ HARD-CODED EXCEPTION LIST ---------------------------
-// Any tab whose URL *starts with* one of these strings is never closed.
-// Plain prefix matching — add trailing "/" to avoid partial domain hits.
-const EXCEPTION_PREFIXES = [
-    "about:",
-];
+const SPARE_PINNED_TABS  = true;
+const SPARE_ACTIVE_TAB   = true;
+const SPARE_AUDIBLE_TABS = true;
+
+const EXCEPTION_PREFIXES = ["about:"];
 
 // ============================================================
 
-// Map<tabId, openedAtTimestamp>
-const tabOpenedAt = new Map();
+// ---- Two clocks + arming set (the persisted state) ---------
+let lastTouchedAt = new Map(); // tabId -> ms of last real interaction (RANKING)
+let graceStartAt  = new Map(); // tabId -> ms the age clock started   (ELIGIBILITY)
+let armedWindows  = new Set(); // windowIds currently above the floor
 
-// ---- Helpers -----------------------------------------------
+const nowMs = () => Date.now();
+
+// ---- Persistence (survives background-worker suspension) ----
+const SESSION_KEY = "tabSlayerState";
+let hydrated = false;
+
+async function ensureLoaded() {
+    if (hydrated) return;            // already live in this worker
+    const stored = await browser.storage.session.get(SESSION_KEY);
+    const s = stored[SESSION_KEY];
+    if (s) {
+        lastTouchedAt = new Map(s.lastTouched);
+        graceStartAt  = new Map(s.grace);
+        armedWindows  = new Set(s.armed);
+    }
+    hydrated = true;
+}
+
+async function persist() {
+    await browser.storage.session.set({
+        [SESSION_KEY]: {
+            lastTouched: [...lastTouchedAt],
+            grace:       [...graceStartAt],
+            armed:       [...armedWindows],
+        },
+    });
+}
+
+// ---- Clock helpers -----------------------------------------
+
+function touch(tabId, now = nowMs()) {
+    lastTouchedAt.set(tabId, now); // ranking clock only — NOT eligibility
+}
+
+// Seed both clocks for a tab we haven't seen before.
+function ensureKnown(tabId, now) {
+    if (!lastTouchedAt.has(tabId)) lastTouchedAt.set(tabId, now);
+    if (!graceStartAt.has(tabId))  graceStartAt.set(tabId, now);
+}
+
+// Reset only the AGE clock for a whole window (arm/disarm transition).
+function resetAges(tabs, now) {
+    for (const tab of tabs) graceStartAt.set(tab.id, now);
+}
+
+function forget(tabId) {
+    lastTouchedAt.delete(tabId);
+    graceStartAt.delete(tabId);
+}
+
+// ---- Counting & exemptions ---------------------------------
+
+function unpinnedCount(tabs) {
+    return tabs.filter(tab => !tab.pinned).length; // pinned never counted
+}
 
 function isExempt(tab) {
     if (!tab) return true;
-
-    // Pinned tabs
-    if (SPARE_PINNED_TABS && tab.pinned) return true;
-
-    // Active tab in its window
-    if (SPARE_ACTIVE_TAB && tab.active) return true;
-
-    // Audible tabs
+    if (SPARE_PINNED_TABS  && tab.pinned)  return true;
+    if (SPARE_ACTIVE_TAB   && tab.active)  return true;
     if (SPARE_AUDIBLE_TABS && tab.audible) return true;
-
-    // Exception URL list
     const url = tab.url || "";
-    if (EXCEPTION_PREFIXES.some(prefix => url.startsWith(prefix))) return true;
-
+    if (EXCEPTION_PREFIXES.some(p => url.startsWith(p))) return true;
     return false;
 }
 
-function nowMs() {
-    return Date.now();
+// ---- Arming state machine ----------------------------------
+// Resets the AGE clocks on either crossing; leaves last-touched alone.
+function syncArming(windowId, tabs, now) {
+    const overFloor = unpinnedCount(tabs) > MAX_TABS;
+    const wasArmed  = armedWindows.has(windowId);
+
+    if (overFloor && !wasArmed) {
+        armedWindows.add(windowId);
+        resetAges(tabs, now); // crossed up → ages begin counting
+        console.log(`[Tab Slayer] Window ${windowId} ARMED — age clocks started.`);
+    } else if (!overFloor && wasArmed) {
+        armedWindows.delete(windowId);
+        resetAges(tabs, now); // dropped back → ages reset to zero
+        console.log(`[Tab Slayer] Window ${windowId} disarmed — age clocks reset.`);
+    }
+    return overFloor;
 }
 
-// ---- Track tab creation ------------------------------------
+// ---- Victim selection (pure, one window) -------------------
+// Eligibility by AGE (graceStartAt); ordering by LAST-TOUCHED.
+function chooseVictims(tabs, now) {
+    const overBy = unpinnedCount(tabs) - MAX_TABS;
+    if (overBy <= 0) return new Set();
 
-browser.tabs.onCreated.addListener(tab => {
-    tabOpenedAt.set(tab.id, nowMs());
-    console.log(`[Tab Slayer] Tracking tab ${tab.id} opened at ${new Date().toLocaleTimeString()}`);
+    const eligible = tabs
+        .filter(tab => !isExempt(tab))
+        .filter(tab => now - (graceStartAt.get(tab.id) ?? now) >= TAB_MAX_AGE_MS)
+        // oldest first = smallest last-touched time = least recently used
+        .sort((a, b) =>
+            (lastTouchedAt.get(a.id) ?? now) - (lastTouchedAt.get(b.id) ?? now));
+
+    const victims = new Set();
+    for (const tab of eligible) {
+        if (victims.size >= overBy) break; // only trim back to the floor
+        victims.add(tab.id);
+    }
+    return victims;
+}
+
+// ---- The Reaper (alarm-driven) -----------------------------
+
+async function reap() {
+    await ensureLoaded();
+    const now = nowMs();
+    const windows = await browser.windows.getAll({
+        populate: true,
+        windowTypes: ["normal"],
+    });
+
+    let total = 0;
+    for (const win of windows) {
+        for (const t of win.tabs) ensureKnown(t.id, now);
+
+        if (!syncArming(win.id, win.tabs, now)) continue;
+
+        const victims = chooseVictims(win.tabs, now);
+        if (victims.size === 0) continue;
+
+        const byId = Object.fromEntries(win.tabs.map(t => [t.id, t]));
+        console.log(`[Tab Slayer] Window ${win.id}: closing ${victims.size} tab(s):`);
+        for (const tabId of victims) {
+            const tab = byId[tabId];
+            const ageMin   = Math.round((now - (graceStartAt.get(tabId)  ?? now)) / 60000);
+            const idleMin  = Math.round((now - (lastTouchedAt.get(tabId) ?? now)) / 60000);
+            console.log(`  → [${tabId}] "${tab?.title}" (age ${ageMin}m, idle ${idleMin}m) — ${tab?.url}`);
+            forget(tabId);
+            await browser.tabs.remove(tabId);
+        }
+
+        // Re-evaluate now that the window is smaller (may disarm + reset ages).
+        const after = await browser.windows.get(win.id, { populate: true });
+        syncArming(win.id, after.tabs, nowMs());
+        total += victims.size;
+    }
+
+    if (total === 0) {
+        console.log(`[Tab Slayer] Reaper ran — no victims at ${new Date().toLocaleTimeString()}`);
+    }
+    await persist();
+}
+
+// ---- Re-evaluate one window after a change -----------------
+async function refreshWindow(windowId) {
+    if (windowId === undefined || windowId === browser.windows.WINDOW_ID_NONE) return;
+    await ensureLoaded();
+    let win;
+    try {
+        win = await browser.windows.get(windowId, { populate: true });
+    } catch {
+        armedWindows.delete(windowId); // window gone
+        await persist();
+        return;
+    }
+    if (win.type !== "normal") return;
+    const now = nowMs();
+    for (const t of win.tabs) ensureKnown(t.id, now);
+    syncArming(win.id, win.tabs, now);
+    await persist();
+}
+
+// ---- Tab lifecycle tracking --------------------------------
+
+browser.tabs.onCreated.addListener(async tab => {
+    await ensureLoaded();
+    const now = nowMs();
+    ensureKnown(tab.id, now); // new tab gets its own fresh age + touch
+    await persist();
+    await refreshWindow(tab.windowId); // may push window over the floor
 });
 
-// Remove tracking when a tab is closed externally
-browser.tabs.onRemoved.addListener(tabId => {
-    tabOpenedAt.delete(tabId);
+browser.tabs.onRemoved.addListener(async (tabId, info) => {
+    await ensureLoaded();
+    forget(tabId);
+    await persist();
+    if (!info.isWindowClosing) await refreshWindow(info.windowId); // user closed one → maybe disarm
 });
 
-// ---- Seed existing tabs on extension start -----------------
-// Tabs already open when the extension loads get a generous grace period —
-// we treat them as if they just opened (current time).  If you'd rather
-// kill long-running old tabs quickly, set seedAge to e.g. TAB_MAX_AGE_MS * 0.9.
+browser.tabs.onActivated.addListener(async ({ tabId }) => {
+    await ensureLoaded();
+    touch(tabId);            // ranking only
+    await persist();
+});
+
+browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+    await ensureLoaded();
+    let dirty = false;
+    if (changeInfo.status === "loading" && changeInfo.url) { touch(tabId); dirty = true; }
+    await persist();
+    if (changeInfo.pinned !== undefined) await refreshWindow(tab.windowId); // pin/unpin shifts count
+    else if (dirty) { /* already persisted */ }
+});
+
+browser.tabs.onAttached.addListener((tabId, info) => refreshWindow(info.newWindowId));
+browser.tabs.onDetached.addListener((tabId, info) => refreshWindow(info.oldWindowId));
+
+// ---- Bootstrap ---------------------------------------------
 
 async function seedExistingTabs() {
+    await ensureLoaded();
+    const now = nowMs();
     const tabs = await browser.tabs.query({});
-    const seed = nowMs();
-    for (const tab of tabs) {
-        if (!tabOpenedAt.has(tab.id)) {
-            tabOpenedAt.set(tab.id, seed);
-        }
-    }
+    for (const tab of tabs) ensureKnown(tab.id, now); // seeds only unknowns
+    await persist();
     console.log(`[Tab Slayer] Seeded ${tabs.length} existing tab(s).`);
 }
 
-// ---- Reset timer on tab visit ------------------------------
-
-browser.tabs.onActivated.addListener(({ tabId }) => {
-    if (tabOpenedAt.has(tabId)) {
-        tabOpenedAt.set(tabId, nowMs());
-        console.log(`[Tab Slayer] Timer reset for tab ${tabId} (activated)`);
-    }
-});
-
-browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    // Only reset on full page navigations, not minor updates (favicon, title, etc.)
-    if (changeInfo.status === "loading" && changeInfo.url) {
-        tabOpenedAt.set(tabId, nowMs());
-        console.log(`[Tab Slayer] Timer reset for tab ${tabId} (navigated to ${changeInfo.url})`);
-    }
-});
-
-// ---- The Reaper --------------------------------------------
-
-async function reap() {
-    console.log("REAP");
-    const now = nowMs();
-    const tabs = await browser.tabs.query({});
-
-    const victims = new Set();
-
-    // Candidates: non-exempt tabs old enough to close, oldest first.
-    const candidates = tabs
-        .filter(t => !isExempt(t))
-        .filter(t => {
-            const openedAt = tabOpenedAt.get(t.id);
-            if (openedAt === undefined) {
-                tabOpenedAt.set(t.id, now);
-                return false;
-            }
-            return (now - openedAt) >= TAB_MAX_AGE_MS;
-        })
-        .sort((a, b) => (tabOpenedAt.get(a.id) ?? now) - (tabOpenedAt.get(b.id) ?? now));
-
-    // Never close tabs if doing so would bring the total below MAX_TABS.
-    const maxVictims = Math.max(0, tabs.length - MAX_TABS);
-
-    for (const tab of candidates) {
-        if (victims.size >= maxVictims) break;
-        victims.add(tab.id);
-    }
-
-    // ---- Close all victims ---------------------------------
-    if (victims.size === 0) {
-        console.log(`[Tab Slayer] Reaper ran — no victims at ${new Date().toLocaleTimeString()}`);
-        return;
-    }
-
-    const tabMap = Object.fromEntries(tabs.map(t => [t.id, t]));
-    console.log(`[Tab Slayer] Closing ${victims.size} tab(s):`);
-    for (const tabId of victims) {
-        const tab = tabMap[tabId];
-        const ageMinutes = Math.round((now - (tabOpenedAt.get(tabId) ?? now)) / 60000);
-        console.log(`  → [${tabId}] "${tab?.title}" (${ageMinutes}m old) — ${tab?.url}`);
-        tabOpenedAt.delete(tabId);
-        await browser.tabs.remove(tabId);
-    }
+function installAlarm() {
+    browser.alarms.create("reaper", {
+        delayInMinutes: 0.5,
+        periodInMinutes: REAPER_INTERVAL_MS / 60000,
+    });
 }
-// ---- Bootstrap ---------------------------------------------
 
-async function init() {
-    console.log("THE REAPER AWAKENS")
+browser.alarms.onAlarm.addListener(alarm => {
+    if (alarm.name === "reaper") reap();
+});
+
+// Runs on every cold start of the background worker (idempotent).
+(async function init() {
     await seedExistingTabs();
-    // Run an initial sweep after a short grace period
-    setTimeout(reap, 30_000);
-    // Then on a regular interval
-    setInterval(reap, REAPER_INTERVAL_MS);
+    installAlarm();
     console.log(
-        `[Tab Slayer] Running. Max age: ${TAB_MAX_AGE_MS / 60000}min, ` +
-        `sweep every ${REAPER_INTERVAL_MS / 60000}min.`
+        `[Tab Slayer] Running. Grace: ${TAB_MAX_AGE_MS / 60000}min, ` +
+        `arm floor: ${MAX_TABS} unpinned/window, sweep every ${REAPER_INTERVAL_MS / 60000}min.`
     );
-}
-
-init();
+})();

@@ -8,7 +8,9 @@
     "96": "icons/slayer-96.png"
   },
   "permissions": [
-    "tabs"
+    "tabs",
+    "alarms",
+    "storage"
   ],
   "author": "engineernick",
   "browser_specific_settings": {
